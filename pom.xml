@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>meridian</groupId>
+    <artifactId>meridian-teleport</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+
+    <!-- Teleport: a Layer-1 (jedi) module. The teleport mechanism itself lives
+         in core (Player.teleport); this module drives it and adds the map-teleport
+         feature, which needs raw protocol packets: it rewrites the S2C
+         UpdateWorldMapSettings to show the map's teleport UI, and intercepts the
+         C2S TeleportToWorldMapPosition to drive the cheat teleport (dropping the
+         original so the permission-gated server path never rejects it). -->
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-api</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- jedi opt-in: UpdateWorldMapSettings / TeleportToWorldMapPosition. -->
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-protocol</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- World / Player building blocks + the SelectionBus fill. -->
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-core-api</artifactId>
+            <version>0.1.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- PacketHandler's methods carry a Netty ChannelHandlerContext. -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.100.Final</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.9</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

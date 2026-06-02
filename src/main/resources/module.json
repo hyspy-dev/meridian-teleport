@@ -1,0 +1,14 @@
+{
+  "name": "Meridian Teleport",
+  "version": "0.1.0",
+  "main": "meridian.teleport.TeleportModule",
+  "priority": 100,
+  "updateUrl": "https://github.com/hyspy-dev/meridian-teleport/releases",
+  "dependsOn": {
+    "meridian-core": ">=0.2.0"
+  },
+  "requires": {
+    "packets": ["UpdateWorldMapSettings", "TeleportToWorldMapPosition"],
+    "services": ["meridian.core.api.World"]
+  }
+}
