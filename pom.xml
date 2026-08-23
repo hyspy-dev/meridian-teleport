@@ -30,7 +30,7 @@
         <dependency>
             <groupId>meridian</groupId>
             <artifactId>meridian-protocol</artifactId>
-            <version>1.0.0-SNAPSHOT</version>
+            <version>245610536</version>
             <scope>provided</scope>
         </dependency>
         <!-- World / Player building blocks + the SelectionBus fill. -->
