@@ -1,6 +1,6 @@
 {
   "name": "Meridian Teleport",
-  "version": "0.1.0",
+  "version": "${project.version}",
   "main": "meridian.teleport.TeleportModule",
   "priority": 100,
   "updateUrl": "https://github.com/hyspy-dev/meridian-teleport/releases",

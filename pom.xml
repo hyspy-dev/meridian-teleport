@@ -57,6 +57,20 @@
     </dependencies>
 
     <build>
+        <resources>
+            <!-- Filter module.json so its "version" always equals the pom version (which the
+                 release workflow sets from the tag) - one version authority, no hand-kept copy. -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes><include>module.json</include></includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes><exclude>module.json</exclude></excludes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
