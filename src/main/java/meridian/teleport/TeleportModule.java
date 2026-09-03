@@ -28,6 +28,8 @@ import org.slf4j.Logger;
  * <p>This module adds:
  * <ul>
  *   <li><b>Manual</b> — X/Y/Z fields + a Teleport button.</li>
+ *   <li><b>A {@link meridian.core.api.Teleport} service</b> — the same teleport, offered to
+ *       other modules: they name a place, this works out the height and goes.</li>
  *   <li><b>Map teleport</b> — rewrites the S2C {@code UpdateWorldMapSettings} so
  *       the in-game map shows its teleport UI ({@link WorldMapSettingsRewriter}),
  *       and intercepts the C2S {@code TeleportToWorldMapPosition}
@@ -63,6 +65,9 @@ public class TeleportModule implements ProxyModule {
     public void onEnable(ModuleContext ctx) {
         this.log = ctx.getLogger();
         this.world = ctx.services().require(World.class);
+        // Offered to anything that has a place but no way to get there - the world map's
+        // right-click, for one. The height at a column is this module's business, not theirs.
+        ctx.services().provide(meridian.core.api.Teleport.class, new Service());
         SelectionBus selectionBus = ctx.services().get(SelectionBus.class).orElse(null);
 
         // Map teleport: show the map's teleport UI (S2C rewrite) and intercept
@@ -127,6 +132,29 @@ public class TeleportModule implements ProxyModule {
         player.teleport(new Vec3(worldX, y, worldZ));
         status = String.format("Map teleport → (%d, %.0f, %d)", worldX, y, worldZ);
         log.info("teleport: map teleport -> ({}, {}, {})", worldX, y, worldZ);
+    }
+
+    /**
+     * What other modules see of this one: somewhere to go, and the height worked out here.
+     */
+    private final class Service implements meridian.core.api.Teleport {
+
+        @Override
+        public void toColumn(int blockX, int blockZ) {
+            onMapTeleport(blockX, blockZ);
+        }
+
+        @Override
+        public void to(Vec3 where) {
+            Optional<Player> maybe = world.player();
+            if (maybe.isEmpty()) {
+                log.warn("teleport: asked to go to {} but there is no session", where);
+                return;
+            }
+            maybe.get().teleport(where);
+            status = String.format("Teleport → (%.0f, %.0f, %.0f)",
+                    where.x(), where.y(), where.z());
+        }
     }
 
     /** Highest solid block at the column + 1, or the player's current Y if unloaded. */
