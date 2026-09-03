@@ -14,7 +14,7 @@
          C2S TeleportToWorldMapPosition to drive the cheat teleport (dropping the
          original so the permission-gated server path never rejects it). -->
     <properties>
-        <meridian.protocol.version>245610536</meridian.protocol.version>
+        <meridian.protocol.version>636045167</meridian.protocol.version>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
