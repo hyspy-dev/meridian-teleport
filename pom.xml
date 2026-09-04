@@ -28,12 +28,6 @@
             <scope>provided</scope>
         </dependency>
         <!-- jedi opt-in: UpdateWorldMapSettings / TeleportToWorldMapPosition. -->
-        <dependency>
-            <groupId>meridian</groupId>
-            <artifactId>meridian-protocol</artifactId>
-            <version>${meridian.protocol.version}</version>
-            <scope>provided</scope>
-        </dependency>
         <!-- World / Player building blocks + the SelectionBus fill. -->
         <dependency>
             <groupId>meridian</groupId>
