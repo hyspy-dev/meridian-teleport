@@ -1,7 +1,9 @@
 package meridian.teleport;
 
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -40,6 +42,9 @@ import org.slf4j.Logger;
  *       of any one protocol build.</li>
  *   <li><b>Chain teleport</b> — a distant target reached in hops, for a server that caps
  *       how far one teleport may go, optionally settling onto the ground where it arrives.</li>
+ *   <li><b>Recent jumps</b> — the last few targets, click one to go back. What it is for is a
+ *       client and a server that have stopped agreeing on where the player is: the last target
+ *       is the position that was meant, and jumping to it again settles that.</li>
  * </ul>
  */
 public class TeleportModule implements ProxyModule {
@@ -61,6 +66,9 @@ public class TeleportModule implements ProxyModule {
 
     /** How far out the safe-spot drop looks for a column to land in. */
     private static final int SAFE_SEARCH_RADIUS = 8;
+
+    /** How many past targets the history keeps: the older ones are no use for getting back. */
+    private static final int HISTORY_MAX = 10;
 
     private Logger log;
     private World world;
@@ -97,6 +105,11 @@ public class TeleportModule implements ProxyModule {
 
     private volatile String status = "Idle.";
 
+    // Where we have been — the last few teleport targets, newest first.
+    private final Deque<Vec3> history = new ArrayDeque<>();
+    /** The rendered rows, kept ready so the UI's poll reads a field instead of the deque. */
+    private volatile List<String> historyRows = List.of();
+
     @Override
     public void onEnable(ModuleContext ctx) {
         this.log = ctx.getLogger();
@@ -114,7 +127,6 @@ public class TeleportModule implements ProxyModule {
         this.mapView = ctx.services().require(WorldMapView.class);
         applyMapTeleport(mapTeleport);
 
-        // X/Y/Z are a per-session target — not worth persisting a random triple.
         ctx.registerSettings(SettingsSpec.builder()
                 .string("x", "X", "", v -> xText = v == null ? "" : v, xBinding)
                 .string("y", "Y", "", v -> yText = v == null ? "" : v, yBinding)
@@ -131,16 +143,20 @@ public class TeleportModule implements ProxyModule {
                 .section("Chain teleport", SettingsSpec.builder()
                         .bool("chain", "Chain teleport (hop to distant targets)", false,
                                 v -> chain = v)
-                        .int_("hopBlocks", "Max distance per hop (blocks)", 1, 1024,
+                        .int_("hopBlocks", "Max distance per hop (blocks)", 1, 8192,
                                 DEFAULT_HOP_BLOCKS, v -> hopBlocks = Math.max(1, v))
-                        .int_("hopDelayMs", "Delay before each hop (ms)", 0, 10000,
+                        .int_("hopDelayMs", "Delay before each hop (ms)", 0, 60000,
                                 DEFAULT_HOP_DELAY_MS, v -> hopDelayMs = Math.max(0, v))
                         .bool("freezeY",
                                 "Freeze Y at " + FREEZE_Y + " while chaining (glide over terrain)",
                                 false, v -> freezeY = v)
                         .button("Abort chain, drop to nearest safe spot", this::dropToSafe)
                         .build())
+                .liveList("Recent jumps (newest first, click to go back)",
+                        () -> historyRows, this::goBack)
                 .liveText("Status", () -> status)
+                .persistent("x", "y", "z", "mapTeleport", "safeTeleport",
+                        "chain", "hopBlocks", "hopDelayMs", "freezeY")
                 .build());
 
         // Cross-module fill: ESP's "nearest block" click (or any SelectionBus
@@ -215,6 +231,20 @@ public class TeleportModule implements ProxyModule {
      * about hops and the others not.
      */
     private void goTo(Player player, Vec3 target, String what) {
+        goTo(player, target, what, true);
+    }
+
+    /**
+     * As above, with a say in whether the target joins the history.
+     *
+     * @param keep {@code false} for a jump made <em>from</em> the history: a trip back is not a
+     *             place we have newly been, and letting it write would push the older entries out
+     *             with copies of themselves
+     */
+    private void goTo(Player player, Vec3 target, String what, boolean keep) {
+        if (keep) {
+            remember(target);
+        }
         long run = chainRun.incrementAndGet();
         Vec3 from = player.position();
         if (!chain || from == null) {
@@ -599,6 +629,63 @@ public class TeleportModule implements ProxyModule {
             return pos.y();
         }
         return 128;   // last-resort default
+    }
+
+    // ------------------------------------------------------------------
+    // Where we have been
+    // ------------------------------------------------------------------
+
+    /**
+     * Puts a target at the head of the history, keeping the last {@link #HISTORY_MAX}.
+     *
+     * <p>This is the place to come back to when the client and the server stop agreeing on where
+     * the player is: the position they were last sent to is the one that was meant, and a jump
+     * back to it settles the argument.
+     *
+     * <p>Called from whichever thread asked for the teleport - the UI's, core's map thread, the
+     * scheduler's - so the deque is held while it is read or written, and the rows the UI polls
+     * are a finished list published under the same lock.
+     */
+    private void remember(Vec3 target) {
+        synchronized (history) {
+            Vec3 newest = history.peekFirst();
+            if (newest != null && same(newest, target)) {
+                return;                     // the same place twice running is one entry, not two
+            }
+            history.addFirst(target);
+            while (history.size() > HISTORY_MAX) {
+                history.removeLast();
+            }
+            List<String> rows = new ArrayList<>(history.size());
+            for (Vec3 p : history) {
+                rows.add(String.format("(%s, %s, %s)", trim(p.x()), trim(p.y()), trim(p.z())));
+            }
+            historyRows = List.copyOf(rows);
+        }
+    }
+
+    /** History click - back to that target, without the trip itself joining the list. */
+    private void goBack(int rowIndex) {
+        Vec3 to;
+        synchronized (history) {
+            if (rowIndex < 0 || rowIndex >= history.size()) {
+                return;                     // the list moved under the click
+            }
+            to = List.copyOf(history).get(rowIndex);
+        }
+        Player player = player();
+        if (player == null) {
+            return;
+        }
+        log.info("teleport: back to ({}, {}, {})", to.x(), to.y(), to.z());
+        goTo(player, to, "Back", false);
+    }
+
+    /** Whether two targets are the same place, to the block. */
+    private static boolean same(Vec3 a, Vec3 b) {
+        return Math.abs(a.x() - b.x()) < 0.01
+                && Math.abs(a.y() - b.y()) < 0.01
+                && Math.abs(a.z() - b.z()) < 0.01;
     }
 
     // ------------------------------------------------------------------

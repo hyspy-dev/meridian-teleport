@@ -42,6 +42,23 @@ player.clearHold();
 |---------|----------------|--------|
 | **Teleport** | `Player.teleport` | Real teleport — the player actually moves. |
 | **Server-side offset** | `Player.holdPosition` / `clearHold` | The server / other players see the player elsewhere while their own client stays put (advanced). |
+| **Recent jumps** | `Player.teleport` | The last 10 targets, newest first — click one to go back there. |
+
+Settings are remembered between runs: the X / Y / Z target, map teleport, safe
+teleport and everything under *Chain teleport*. The server-side offset is not —
+it is a live effect on a session, and a box that came back ticked with nothing
+behind it would be lying.
+
+## Recent jumps
+
+Every teleport that actually goes somewhere — the button, the map, another
+module through the `Teleport` service — puts its target at the head of the list,
+which keeps the last 10. Going back by clicking a row does *not* add an entry:
+the list stays the trail of places you went to, not of times you looked at it.
+
+Its use is a desync — the client and the server disagreeing about where the
+player is. The last target is the position that was meant, so jumping to it
+again settles the argument.
 
 ## Usage
 
