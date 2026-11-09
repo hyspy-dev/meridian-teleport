@@ -4,8 +4,13 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.swing.SwingUtilities;
 import meridian.api.module.ModuleContext;
@@ -13,7 +18,6 @@ import meridian.api.module.ProxyModule;
 import meridian.api.module.Scheduler;
 import meridian.api.settings.SettingBinding;
 import meridian.api.settings.SettingsSpec;
-import meridian.core.api.Block;
 import meridian.core.api.Player;
 import meridian.core.api.SelectionBus;
 import meridian.core.api.Vec3;
@@ -29,7 +33,17 @@ import org.slf4j.Logger;
  * client a {@code ClientTeleport} (repeated, so the client's own move cycle can't
  * override it) and pins the server at the target — a real teleport the player
  * sees, with no distance / permission gate. {@link Player#holdPosition} is the
- * server-side offset variant.
+ * server-side offset variant. Where to stand when it is there is core's too:
+ * {@link World#surfaceAt the surface} of a column, {@link World#safeSpotNear a safe spot}
+ * near a point, {@link World#hurtsAt what hurts}.
+ *
+ * <p>Two modes:
+ * <ul>
+ *   <li><b>tp</b> — to the point; with landing on, once the ground there has arrived, onto the
+ *       surface of its column.</li>
+ *   <li><b>safe tp</b> — to the point, then onto the safe spot nearest it: solid ground with room
+ *       for the body, out of water and lava.</li>
+ * </ul>
  *
  * <p>This module adds:
  * <ul>
@@ -41,7 +55,7 @@ import org.slf4j.Logger;
  *       packets; this module only says what it wants of them, which is what keeps it clear
  *       of any one protocol build.</li>
  *   <li><b>Chain teleport</b> — a distant target reached in hops, for a server that caps
- *       how far one teleport may go, optionally settling onto the ground where it arrives.</li>
+ *       how far one teleport may go, landing where it arrives.</li>
  *   <li><b>Recent jumps</b> — the last few targets, click one to go back. What it is for is a
  *       client and a server that have stopped agreeing on where the player is: the last target
  *       is the position that was meant, and jumping to it again settles that.</li>
@@ -49,22 +63,22 @@ import org.slf4j.Logger;
  */
 public class TeleportModule implements ProxyModule {
 
-    /** Y-column scan range when resolving a map coordinate's surface height. */
-    private static final int SCAN_TOP = 400;
-    private static final int SCAN_BOTTOM = -64;
+    private static final String USAGE = "tp <x y z> | safe <x y z> | column <x z> | drop";
+
+    /** How high a chain hop that would land in lava may be lifted to clear it. */
+    private static final int LAVA_RISE_TOP = 400;
 
     /** Default hop length, in blocks, and the pause before each hop. */
     private static final int DEFAULT_HOP_BLOCKS = 48;
     private static final int DEFAULT_HOP_DELAY_MS = 250;
 
-    /** How long to wait for a hop's chunk to arrive before going on without it. */
-    private static final int SETTLE_TRIES = 20;
-    private static final Duration SETTLE_POLL = Duration.ofMillis(100);
+    /** How long to wait for the ground where the player arrived before going on without it. */
+    private static final Duration LAND_WAIT = Duration.ofSeconds(2);
 
     /** The height a chain glides at when its Y is frozen - well above any terrain. */
     private static final int FREEZE_Y = 250;
 
-    /** How far out the safe-spot drop looks for a column to land in. */
+    /** How far out the safe-spot search looks for a column to land in. */
     private static final int SAFE_SEARCH_RADIUS = 8;
 
     /** How many past targets the history keeps: the older ones are no use for getting back. */
@@ -76,11 +90,15 @@ public class TeleportModule implements ProxyModule {
     private Scheduler scheduler;
     private volatile boolean mapTeleport = true;
 
+    /** Land when the player arrives: wait for the ground, stand on it. Off: the coordinates as given. */
+    private volatile boolean land = true;
+    /** The mode: {@code safe tp} (the nearest safe spot) rather than {@code tp} (the surface). */
+    private volatile boolean safeTp;
+
     // Chain teleport.
     private volatile boolean chain;
     private volatile int hopBlocks = DEFAULT_HOP_BLOCKS;
     private volatile int hopDelayMs = DEFAULT_HOP_DELAY_MS;
-    private volatile boolean settleOnGround = true;
     /** Hold the chain's height at {@link #FREEZE_Y} while it crosses, so it glides over terrain. */
     private volatile boolean freezeY;
     /**
@@ -104,6 +122,8 @@ public class TeleportModule implements ProxyModule {
     private final SettingBinding<String> zBinding = new SettingBinding<>();
 
     private volatile String status = "Idle.";
+    /** Where the player was last sent - the landing, once a teleport is over. */
+    private volatile Vec3 lastSent;
 
     // Where we have been — the last few teleport targets, newest first.
     private final Deque<Vec3> history = new ArrayDeque<>();
@@ -135,10 +155,11 @@ public class TeleportModule implements ProxyModule {
                 .button("Teleport", this::teleportTo)
                 .bool("mapTeleport", "Map teleport (show UI + intercept)", true,
                         this::applyMapTeleport)
-                // Safe teleport rides above the offset: it applies to every teleport, single or
-                // chained - land on the surface once the chunk is there rather than in the air.
-                .bool("safeTeleport", "Safe teleport (wait for the chunk, land on the surface)",
-                        true, v -> settleOnGround = v)
+                // Both ride above the offset: they apply to every teleport, single or chained.
+                .bool("land", "Land on arrival (wait for the chunk, stand on the surface)",
+                        true, v -> land = v)
+                .bool("safeTp", "Safe tp (stand on the nearest safe spot instead: solid ground, "
+                        + "room, no water or lava)", false, v -> safeTp = v)
                 .bool("hold", "Server-side offset (client stays put)", false, this::setHold)
                 .section("Chain teleport", SettingsSpec.builder()
                         .bool("chain", "Chain teleport (hop to distant targets)", false,
@@ -155,7 +176,7 @@ public class TeleportModule implements ProxyModule {
                 .liveList("Recent jumps (newest first, click to go back)",
                         () -> historyRows, this::goBack)
                 .liveText("Status", () -> status)
-                .persistent("x", "y", "z", "mapTeleport", "safeTeleport",
+                .persistent("x", "y", "z", "mapTeleport", "land", "safeTp",
                         "chain", "hopBlocks", "hopDelayMs", "freezeY")
                 .build());
 
@@ -165,6 +186,14 @@ public class TeleportModule implements ProxyModule {
             selectionBus.lastBlock().ifPresent(p -> applyXyz(p.x(), p.y(), p.z()));
             selectionBus.onBlockSelected(p ->
                     SwingUtilities.invokeLater(() -> applyXyz(p.x(), p.y(), p.z())));
+        }
+
+        // The same teleports on the proxy's command channel - teleport <conn> ... - answered once
+        // the player has landed.
+        try {
+            ctx.registerCommand("teleport", USAGE, (args, json) -> command(args));
+        } catch (NoSuchMethodError olderProxy) {
+            // no command channel there
         }
 
         log.info("meridian-teleport enabled — Player.teleport + map teleport via core");
@@ -200,22 +229,25 @@ public class TeleportModule implements ProxyModule {
 
     /**
      * Drives the cheat teleport from a map-picked coordinate. The height is the surface at that
-     * column (mirroring the server's own {@code height + 2}) when the chunk is loaded, else the
-     * player's current Y.
+     * column when core knows it, else the player's current Y.
      *
      * @return whether it was carried out, and so must not be passed to the server
      */
     private boolean onMapTeleport(int worldX, int worldZ) {
+        return toColumn(worldX, worldZ, safeTp) != null;
+    }
+
+    /** The map's teleport, in the given mode: off when there is no player. */
+    private CompletableFuture<Void> toColumn(int worldX, int worldZ, boolean safe) {
         Optional<Player> maybe = world.player();
         if (maybe.isEmpty()) {
             log.warn("teleport: map teleport but no session");
-            return false;
+            return null;
         }
         Player player = maybe.get();
         double y = resolveY(worldX, worldZ, player);
         log.info("teleport: map teleport -> ({}, {}, {})", worldX, y, worldZ);
-        goTo(player, new Vec3(worldX, y, worldZ), "Map teleport");
-        return true;
+        return goTo(player, new Vec3(worldX, y, worldZ), "Map teleport", true, safe);
     }
 
     // ------------------------------------------------------------------
@@ -223,42 +255,38 @@ public class TeleportModule implements ProxyModule {
     // ------------------------------------------------------------------
 
     /**
-     * Takes the player to a point, by whatever route the settings ask for.
+     * Takes the player to a point, by whatever route the settings ask for, and lands as the mode
+     * says.
      *
      * <p>Everything that moves the player goes through here: the button, the map, and the
      * {@link meridian.core.api.Teleport} service other modules use. A server that caps how far
      * one teleport may go caps all of them equally, so there is no sense in one of them knowing
      * about hops and the others not.
-     */
-    private void goTo(Player player, Vec3 target, String what) {
-        goTo(player, target, what, true);
-    }
-
-    /**
-     * As above, with a say in whether the target joins the history.
      *
      * @param keep {@code false} for a jump made <em>from</em> the history: a trip back is not a
      *             place we have newly been, and letting it write would push the older entries out
      *             with copies of themselves
+     * @param safe {@code safe tp}: onto the safe spot nearest the target once there
+     * @return done when the player has landed, or the trip was given up or overtaken by another
      */
-    private void goTo(Player player, Vec3 target, String what, boolean keep) {
+    private CompletableFuture<Void> goTo(Player player, Vec3 target, String what, boolean keep, boolean safe) {
         if (keep) {
             remember(target);
         }
+        CompletableFuture<Void> done = new CompletableFuture<>();
         long run = chainRun.incrementAndGet();
         Vec3 from = player.position();
         if (!chain || from == null) {
-            player.teleport(target);
+            send(player, target);
             status = String.format("%s → (%.0f, %.0f, %.0f)",
                     what, target.x(), target.y(), target.z());
-            if (settleOnGround) {
-                settle(run, target, () -> { });
-            }
-            return;
+            arrive(run, target, what, safe, () -> done.complete(null));
+            return done;
         }
         List<Vec3> hops = hopsFrom(from, target);
         log.info("teleport: {} in {} hop(s) of at most {} block(s)", what, hops.size(), hopBlocks);
-        hop(run, hops, 0, what);
+        hop(run, hops, 0, what, safe, done);
+        return done;
     }
 
     /**
@@ -328,161 +356,78 @@ public class TeleportModule implements ProxyModule {
         int px = (int) Math.floor(pos.x());
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
-        Optional<Vec3> spot = nearestSafeSpot(px, py, pz);
+        Optional<Vec3> spot = world.safeSpotNear(px, py, pz, SAFE_SEARCH_RADIUS);
         if (spot.isEmpty()) {
             status = "No safe spot within " + SAFE_SEARCH_RADIUS + " blocks - nothing loaded there.";
             log.warn("teleport: no safe spot near ({}, {}, {})", px, py, pz);
             return;
         }
         Vec3 to = spot.get();
-        player.teleport(to);
+        send(player, to);
         status = String.format("Dropped to safe spot (%.0f, %.0f, %.0f).", to.x(), to.y(), to.z());
         log.info("teleport: dropped to safe spot ({}, {}, {})", to.x(), to.y(), to.z());
     }
 
-    /**
-     * The nearest column to stand in, searched in rings outwards.
-     *
-     * <p>A spot is ground with two blocks of clear air on top and no lava beneath the feet. The
-     * player's own column is ring zero, so a plain drop down wins when it can; the search widens
-     * only when the column under the player is empty or unloaded.
-     */
-    private Optional<Vec3> nearestSafeSpot(int px, int py, int pz) {
-        for (int r = 0; r <= SAFE_SEARCH_RADIUS; r++) {
-            Vec3 best = null;
-            double bestAway = Double.MAX_VALUE;
-            for (int dx = -r; dx <= r; dx++) {
-                for (int dz = -r; dz <= r; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
-                        continue;           // only the new ring, not the ones already searched
-                    }
-                    int x = px + dx;
-                    int z = pz + dz;
-                    int y = safeStandY(x, z, py);
-                    if (y == Integer.MIN_VALUE) {
-                        continue;
-                    }
-                    double away = dx * dx + dz * dz + (y - py) * (double) (y - py);
-                    if (away < bestAway) {
-                        bestAway = away;
-                        best = new Vec3(x + 0.5, y, z + 0.5);
-                    }
-                }
-            }
-            if (best != null) {
-                return Optional.of(best);
-            }
-        }
-        return Optional.empty();
-    }
-
-    /**
-     * The height to stand at in a column: on top of the nearest solid block that has room above it,
-     * looked for below the player first and then above.
-     *
-     * @return the standing Y, or {@link Integer#MIN_VALUE} when the column has no such place
-     */
-    private int safeStandY(int x, int z, int fromY) {
-        int top = Math.min(SCAN_TOP, fromY);
-        for (int y = top; y >= SCAN_BOTTOM; y--) {   // straight down from the player: a drop
-            if (standable(x, y, z)) {
-                return y + 1;
-            }
-        }
-        for (int y = fromY + 1; y <= SCAN_TOP; y++) { // nothing below: look up instead
-            if (standable(x, y, z)) {
-                return y + 1;
-            }
-        }
-        return Integer.MIN_VALUE;
-    }
-
-    /** Whether {@code (x,y,z)} is solid ground, not lava, with two clear blocks above it. */
-    private boolean standable(int x, int y, int z) {
-        Block ground = world.blockAt(x, y, z);
-        if (ground == null || ground.type() == null || !ground.type().isSolid()) {
-            return false;                   // must be solid ground - water and lava are not
-        }
-        return clear(x, y + 1, z) && clear(x, y + 2, z);
-    }
-
-    /** Whether a block is out of the way - air (which has no type) or anything not solid. */
-    private boolean clear(int x, int y, int z) {
-        Block b = world.blockAt(x, y, z);
-        boolean solid = b != null && b.type() != null && b.type().isSolid();
-        return !solid && world.fluidAt(x, y, z) == null;
-    }
-
-
     /** One hop, then the next - each on the scheduler, so nothing here blocks a caller. */
-    private void hop(long run, List<Vec3> hops, int index, String what) {
+    private void hop(long run, List<Vec3> hops, int index, String what, boolean safe, CompletableFuture<Void> done) {
         if (run != chainRun.get()) {
-            return;                         // a newer teleport has taken over
+            done.complete(null);            // a newer teleport has taken over
+            return;
         }
         if (index >= hops.size()) {
             status = String.format("%s → arrived in %d hop(s).", what, hops.size());
+            done.complete(null);
             return;
         }
         Optional<Player> maybe = world.player();
         if (maybe.isEmpty()) {
             status = what + " stopped — no session.";
+            done.complete(null);
             return;
         }
         Player player = maybe.get();
         Vec3 to = hops.get(index);
         boolean lastHop = index == hops.size() - 1;
 
-        // Fool-proofing: never drop an intermediate hop into lava. (The last hop lands on the
-        // surface through settle, which lifts clear of a pool on its own.) If the hop point is in
-        // lava, hop instead to a lava-free point and carry the chain on from there; if there is no
-        // such point, stop the chain where the player safely stands rather than cook them.
-        if (!lastHop && inLava(to)) {
-            Vec3 safe = lavaFreeAlternative(player.position(), to);
-            if (safe == null) {
+        // Fool-proofing: never drop an intermediate hop into lava. (The last hop lands as the mode
+        // says, which lifts clear of a pool on its own.) If the hop point is in lava, hop instead to
+        // a lava-free point and carry the chain on from there; if there is no such point, stop the
+        // chain where the player safely stands rather than cook them.
+        if (!lastHop && world.hurtsAt(to)) {
+            Vec3 clear = lavaFreeAlternative(player.position(), to);
+            if (clear == null) {
                 chainRun.incrementAndGet();                 // panic stop - no further hops fire
                 status = String.format("%s stopped: lava ahead and nowhere clear to go.", what);
                 log.warn("teleport: {} stopped - hop {} was lava and no safe point near it",
                         what, index + 1);
+                done.complete(null);
                 return;
             }
             Vec3 target = hops.get(hops.size() - 1);
-            player.teleport(safe);
+            send(player, clear);
             status = String.format("%s: hop %d was lava, rerouted to (%.0f, %.0f, %.0f)",
-                    what, index + 1, safe.x(), safe.y(), safe.z());
+                    what, index + 1, clear.x(), clear.y(), clear.z());
             log.info("teleport: {} rerouted around lava to ({}, {}, {})",
-                    what, safe.x(), safe.y(), safe.z());
+                    what, clear.x(), clear.y(), clear.z());
             // Rebuild the rest of the chain from where we actually are now.
-            List<Vec3> rest = hopsFrom(safe, target);
-            scheduler.schedule(() -> hop(run, rest, 0, what), Duration.ofMillis(hopDelayMs));
+            List<Vec3> rest = hopsFrom(clear, target);
+            scheduler.schedule(() -> hop(run, rest, 0, what, safe, done), Duration.ofMillis(hopDelayMs));
             return;
         }
 
-        player.teleport(to);
+        send(player, to);
         status = String.format("%s: hop %d/%d → (%.0f, %.0f, %.0f)",
                 what, index + 1, hops.size(), to.x(), to.y(), to.z());
-        Runnable next = () -> scheduler.schedule(() -> hop(run, hops, index + 1, what),
+        Runnable next = () -> scheduler.schedule(() -> hop(run, hops, index + 1, what, safe, done),
                 Duration.ofMillis(hopDelayMs));
         // Only where the player is actually going to stay. The hops in between are a way of
         // getting past a distance limit, not places anybody stands: waiting for each one's chunk
         // would add seconds a hop to a journey whose whole point is to be over quickly.
-        if (settleOnGround && lastHop) {
-            settle(run, to, next);
+        if (lastHop) {
+            arrive(run, to, what, safe, next);
         } else {
             next.run();
         }
-    }
-
-    /** Whether the two-block space a player would fill at {@code p} is lava. */
-    private boolean inLava(Vec3 p) {
-        int x = (int) Math.floor(p.x());
-        int y = (int) Math.floor(p.y());
-        int z = (int) Math.floor(p.z());
-        return lavaAt(x, y, z) || lavaAt(x, y + 1, z);
-    }
-
-    private boolean lavaAt(int x, int y, int z) {
-        String fluid = world.fluidAt(x, y, z);
-        return fluid != null && fluid.toLowerCase(java.util.Locale.ROOT).contains("lava");
     }
 
     /**
@@ -495,11 +440,10 @@ public class TeleportModule implements ProxyModule {
      * takes the nearest clear point on the way. Null when neither finds one.
      */
     private Vec3 lavaFreeAlternative(Vec3 from, Vec3 to) {
-        int x = (int) Math.floor(to.x());
-        int z = (int) Math.floor(to.z());
-        for (int y = (int) Math.floor(to.y()); y <= SCAN_TOP; y++) {
-            if (!lavaAt(x, y, z) && !lavaAt(x, y + 1, z)) {
-                return new Vec3(to.x(), y, to.z());     // highest: lifted just clear of the lava
+        for (int y = (int) Math.floor(to.y()); y <= LAVA_RISE_TOP; y++) {
+            Vec3 lifted = new Vec3(to.x(), y, to.z());
+            if (!world.hurtsAt(lifted)) {
+                return lifted;                          // lowest: lifted just clear of the lava
             }
         }
         double dx = from.x() - to.x();
@@ -509,7 +453,7 @@ public class TeleportModule implements ProxyModule {
         for (int i = 1; i <= steps; i++) {             // nearest clear point back toward the player
             double f = (double) i / steps;
             Vec3 p = new Vec3(to.x() + dx * f, to.y() + dy * f, to.z() + dz * f);
-            if (!inLava(p)) {
+            if (!world.hurtsAt(p)) {
                 return p;
             }
         }
@@ -517,84 +461,80 @@ public class TeleportModule implements ProxyModule {
     }
 
     /**
-     * Waits for the ground under a hop to arrive, then stands on it.
+     * Lands where the player arrived, as the mode says, then runs {@code then}.
      *
      * <p>Arriving means landing in a chunk the client has never seen: for a moment there is
      * nothing there at all, and a height guessed from the last known ground can be underneath a
-     * hill or a long way above it. So the chunk is given a moment to turn up, and once it has,
-     * the height is worked out properly and the player is put on the surface. If it never turns
-     * up, this gives up rather than waiting - being stuck mid-air is better than being stuck
-     * entirely.
+     * hill or a long way above it. So core is asked to say when the ground there is known, and
+     * only then is the player put on it. If it never comes, this gives up rather than waiting -
+     * being stuck mid-air is better than being stuck entirely.
+     *
+     * <ul>
+     *   <li><b>tp</b>, landing on: onto the surface of the column.</li>
+     *   <li><b>tp</b>, landing off: nothing - the coordinates as given.</li>
+     *   <li><b>safe tp</b>: onto the safe spot nearest the target.</li>
+     * </ul>
      */
-    private void settle(long run, Vec3 at, Runnable then) {
-        settle(run, at, then, 0);
-    }
-
-    private void settle(long run, Vec3 at, Runnable then, int tries) {
-        if (run != chainRun.get()) {
+    private void arrive(long run, Vec3 at, String what, boolean safe, Runnable then) {
+        if (!safe && !land) {
+            then.run();
             return;
         }
         int x = (int) Math.floor(at.x());
         int z = (int) Math.floor(at.z());
-        int surface = surfaceOf(x, z);
-        if (surface == Integer.MIN_VALUE) {
-            // No block loaded in the column yet - the chunk that the teleport asked the server for
-            // has not arrived. Wait and look again; the player is already at the target, so the
-            // server is streaming it. Only once the ground is actually there do we drop onto it.
-            if (tries >= SETTLE_TRIES) {
-                log.info("teleport: no chunk at ({}, {}) after {} ms - left in place",
-                        x, z, SETTLE_TRIES * SETTLE_POLL.toMillis());
+        world.awaitSurface(x, z, LAND_WAIT).whenComplete((surface, error) -> {
+            try {
+                if (run != chainRun.get()) {
+                    return;                 // a newer teleport has taken over
+                }
+                if (safe) {
+                    standSafe(at, what);
+                } else {
+                    standOnSurface(at, x, z, surface == null ? OptionalInt.empty() : surface);
+                }
+            } finally {
                 then.run();
-                return;
-            }
-            scheduler.schedule(() -> settle(run, at, then, tries + 1), SETTLE_POLL);
-            return;
-        }
-        world.player().ifPresent(player -> {
-            if (Math.abs(surface - at.y()) > 0.5) {
-                player.teleport(new Vec3(at.x(), surface, at.z()));
             }
         });
-        then.run();
     }
 
-    /**
-     * The height to stand at in a column, or {@link Integer#MIN_VALUE} when there is no place we
-     * can be sure of.
-     *
-     * <p>The first solid block from the top is the surface - if the column is loaded there. What
-     * makes it a place to stand rather than a guess is the two blocks above it: they have to be
-     * loaded and open. Loaded, because a block with no type at all is a chunk that has not arrived,
-     * not open air - reading it as open is how a landing happened before the surface was there and
-     * ended up in whatever was loaded deeper. Open, so the player is not dropped inside a block.
-     *
-     * <p>It stops at that first solid either way. A solid with unconfirmed air above means the
-     * chunk is still loading, and the answer is to wait, not to go looking deeper and find a cave.
-     */
-    /**
-     * The height to stand on in a column, or {@link Integer#MIN_VALUE} when none is loaded.
-     *
-     * <p>The highest block that is not air is the surface, and everything above it is air by that
-     * very definition - so standing one above it is standing in the open, never inside a block.
-     *
-     * <p>This is the loaded check and the surface finder in one. Air and an unloaded chunk both
-     * read the same here (no block), so the only thing that answers is a real block turning up:
-     * when one does, the chunk has arrived and this is its top. Until then it says "nothing yet",
-     * and the caller waits.
-     */
-    private int surfaceOf(int x, int z) {
-        for (int y = SCAN_TOP; y >= SCAN_BOTTOM; y--) {
-            Block b = world.blockAt(x, y, z);
-            boolean solid = b != null && !b.isAir();
-            boolean fluid = world.fluidAt(x, y, z) != null;
-            if (solid || fluid) {
-                // On solid ground, stand one above it. On a pool - water or lava, which live in
-                // the fluid layer and read as air in the block layer - two above, so the drop
-                // clears the surface rather than landing the player in it.
-                return fluid ? y + 2 : y + 1;
-            }
+    /** {@code tp}: onto the surface, when the column has told it. */
+    private void standOnSurface(Vec3 at, int x, int z, OptionalInt surface) {
+        if (surface.isEmpty()) {
+            log.info("teleport: no ground known at ({}, {}) after {} ms - left in place",
+                    x, z, LAND_WAIT.toMillis());
+            return;
         }
-        return Integer.MIN_VALUE;
+        int y = surface.getAsInt();
+        world.player().ifPresent(player -> {
+            if (Math.abs(y - at.y()) > 0.5) {
+                send(player, new Vec3(at.x(), y, at.z()));
+            }
+        });
+    }
+
+    /** {@code safe tp}: onto the safe spot nearest the target, or left there when there is none. */
+    private void standSafe(Vec3 at, String what) {
+        int x = (int) Math.floor(at.x());
+        int y = (int) Math.floor(at.y());
+        int z = (int) Math.floor(at.z());
+        Optional<Vec3> spot = world.safeSpotNear(x, y, z, SAFE_SEARCH_RADIUS);
+        if (spot.isEmpty()) {
+            status = String.format("%s: no safe spot within %d blocks of (%d, %d, %d) - left there.",
+                    what, SAFE_SEARCH_RADIUS, x, y, z);
+            log.info("teleport: no safe spot near ({}, {}, {}) - left in place", x, y, z);
+            return;
+        }
+        Vec3 to = spot.get();
+        world.player().ifPresent(player -> send(player, to));
+        status = String.format("%s → safe spot (%.1f, %.0f, %.1f)", what, to.x(), to.y(), to.z());
+        log.info("teleport: safe spot ({}, {}, {}) for ({}, {}, {})", to.x(), to.y(), to.z(), x, y, z);
+    }
+
+    /** Sends the player to a point, remembering it as the last place sent to. */
+    private void send(Player player, Vec3 to) {
+        lastSent = to;
+        player.teleport(to);
     }
 
     /**
@@ -609,26 +549,89 @@ public class TeleportModule implements ProxyModule {
 
         @Override
         public void to(Vec3 where) {
+            go(where, safeTp);
+        }
+
+        @Override
+        public void safeTo(Vec3 where) {
+            go(where, true);
+        }
+
+        private void go(Vec3 where, boolean safe) {
             Optional<Player> maybe = world.player();
             if (maybe.isEmpty()) {
                 log.warn("teleport: asked to go to {} but there is no session", where);
                 return;
             }
-            goTo(maybe.get(), where, "Teleport");
+            goTo(maybe.get(), where, "Teleport", true, safe);
         }
     }
 
     /** The confirmed surface at the column, or the player's current Y when it cannot be confirmed. */
     private double resolveY(int x, int z, Player player) {
-        int surface = surfaceOf(x, z);
-        if (surface != Integer.MIN_VALUE) {
-            return surface;
+        OptionalInt surface = world.surfaceAt(x, z);
+        if (surface.isPresent()) {
+            return surface.getAsInt();
         }
         Vec3 pos = player.position();
         if (pos != null) {
             return pos.y();
         }
         return 128;   // last-resort default
+    }
+
+    // ------------------------------------------------------------------
+    // The command channel
+    // ------------------------------------------------------------------
+
+    /**
+     * {@code tp <x y z>} and {@code safe <x y z>} go in that mode, {@code column <x z>} as the map
+     * does, {@code drop} drops to the safe spot nearest; each answers with where the player is
+     * once it has landed.
+     */
+    private CompletableFuture<?> command(List<String> args) {
+        if (args.isEmpty()) {
+            throw new IllegalArgumentException(USAGE);
+        }
+        String what = args.get(0).toLowerCase(Locale.ROOT);
+        CompletableFuture<Void> done = switch (what) {
+            case "tp", "safe" -> {
+                if (args.size() < 4) {
+                    throw new IllegalArgumentException(USAGE);
+                }
+                Player player = world.player().orElseThrow(() -> new IllegalStateException("no player yet"));
+                Vec3 to = new Vec3(Double.parseDouble(args.get(1)), Double.parseDouble(args.get(2)),
+                        Double.parseDouble(args.get(3)));
+                yield goTo(player, to, what.equals("safe") ? "Safe tp" : "Teleport", true, what.equals("safe"));
+            }
+            case "column" -> {
+                if (args.size() < 3) {
+                    throw new IllegalArgumentException(USAGE);
+                }
+                CompletableFuture<Void> f = toColumn(Integer.parseInt(args.get(1)), Integer.parseInt(args.get(2)), safeTp);
+                if (f == null) {
+                    throw new IllegalStateException("no player yet");
+                }
+                yield f;
+            }
+            case "drop" -> {
+                dropToSafe();
+                yield CompletableFuture.completedFuture(null);
+            }
+            default -> throw new IllegalArgumentException(USAGE);
+        };
+        // The last teleport is sent; the player's position follows once the client has moved.
+        return done.thenCompose(v -> CompletableFuture.supplyAsync(() -> null,
+                        CompletableFuture.delayedExecutor(300, java.util.concurrent.TimeUnit.MILLISECONDS)))
+                .thenApply(v -> {
+                    Map<String, Object> out = new LinkedHashMap<>();
+                    out.put("status", status);
+                    if (lastSent != null) {
+                        out.put("landed", lastSent);
+                    }
+                    world.player().map(Player::position).ifPresent(p -> out.put("position", p));
+                    return out;
+                });
     }
 
     // ------------------------------------------------------------------
@@ -678,7 +681,7 @@ public class TeleportModule implements ProxyModule {
             return;
         }
         log.info("teleport: back to ({}, {}, {})", to.x(), to.y(), to.z());
-        goTo(player, to, "Back", false);
+        goTo(player, to, "Back", false, safeTp);
     }
 
     /** Whether two targets are the same place, to the block. */
@@ -713,7 +716,7 @@ public class TeleportModule implements ProxyModule {
             return;
         }
         log.info("teleport: -> ({}, {}, {})", t.x(), t.y(), t.z());
-        goTo(player, t, "Teleport");
+        goTo(player, t, "Teleport", true, safeTp);
     }
 
     private void setHold(boolean on) {
